@@ -127,3 +127,10 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# API key secret
+secrets/*
+!secrets/secretAPIkey.json
+
+# Ignore testing files
+*.yml
