@@ -134,3 +134,4 @@ secrets/*
 
 # Ignore testing files
 *.yml
+testfiles/
