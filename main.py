@@ -1,14 +1,17 @@
-import yaml
 import re
 import argparse
 import glob
 import sys
 import os
 import html
+import time
 from google.cloud import translate_v2 as translate
 
 # count characters for Google Translate Quota
 totalCharacterCount = 0
+
+# Google Translate delay seconds
+requestDelay = 0.1
 
 # list of supported CK3 languages
 languageKeys = {
@@ -35,21 +38,29 @@ def translate_text_dummy(target, text, keyfile):
     for phrase in text:
         totalCharacterCount = totalCharacterCount + len(phrase)
         # result.append(dict(Result, translatedText='「'+phrase+'」', input=phrase))
-        result.append(dict(Result, translatedText='phrase', input=phrase))
+        result.append(dict(Result, translatedText='&#39;phrase&#39;', input=phrase))
     return result
 
 
 def translate_text(target, text, keyfile):
-    translate_client = translate.Client.from_service_account_json(keyfile)
-
-    print("Making request")
     # Text can also be a sequence of strings, in which case this method
     # will return a sequence of results for each text.
-    result = translate_client.translate(text, target_language=target)
+    global requestDelay
+    translate_client = translate.Client.from_service_account_json(keyfile)
 
-    # print(u"Text: {}".format(result["input"]))
-    # print(u"Translation: {}".format(result["translatedText"]))
-    # print(u"Detected language: {}".format(result["detectedSourceLanguage"]))
+    print("Making request. Delay:", requestDelay)
+
+    for attempt in range(10):
+        try:
+            time.sleep(requestDelay)
+            result = translate_client.translate(text, target_language=target)
+        except:
+            requestDelay = requestDelay * 1.5
+        else:
+            break
+    else:
+        # we failed all the attempts - deal with the consequences.
+        print("Google API request fail", file=sys.stderr)
     return result
 
 
@@ -66,6 +77,9 @@ def main():
     # define print function if verbose flag is set, else it's None
     verbosePrint = print if args.verbose else lambda *a, **k: None
 
+    for i in vars(args):
+        verbosePrint(i, getattr(args, i))
+
     # hopefully cross-platform globs
     fileList = []
     for globString in args.input:
@@ -78,7 +92,7 @@ def main():
         # split directory and filename
         inputDir, inputFileName = os.path.split(inputFile)
         # split input filename into (xxx)_(l_language).yml using regex
-        match = re.fullmatch(r'^(.*)_(l_[a-z_]*)\.yml$', inputFileName)
+        match = re.match(r'^(.*)_(l_[a-z_]*)\.yml$', inputFileName)
         if match is not None:
             nameName = match.group(1)
             nameLanguage = match.group(2)
@@ -90,45 +104,41 @@ def main():
             print("Filename is wrong format:", inputFile, file=sys.stderr)
             continue
 
-        # load file, editing weird CK3 format
-        # valid yaml is '  key: 0 "value"'
-        # CK3 uses ' key:0 "value"'
+        rawText = []
+        with open(inputFile, encoding='utf_8_sig') as yamlFile:
+            for line in yamlFile:
+                rawText.append(line.rstrip())
 
-        # also sometimes xxx:0 "string" is accidentally xxx:0"string"
-        # use regex to add space
-        with open(inputFile) as yamlFile:
-            rawText = ""
-            for lineNum, line in enumerate(yamlFile):
-                if lineNum == 0:
-                    rawText = rawText + line
-                else:
-                    line = re.sub(r'^ *(.+").*', r' \1', line)
-                    rawText = rawText + re.sub(r':([0-9]) *"', r': \1 "', line)
+        innerLanguage = rawText[0][:-1]  # first line is the language
 
-            content = yaml.load(rawText, Loader=yaml.FullLoader)
-
-        innerLanguage = [*content][0]  # dict key is the language
         if innerLanguage != nameLanguage:
             print("Filename language mismatch:", inputFile, file=sys.stderr)
+            print(innerLanguage, file=sys.stderr)
+            print(nameLanguage, file=sys.stderr)
             continue
+        else:
+            rawText[0] = args.language + ':'
 
-        innerContent = content[innerLanguage]
+        translatedText = []
+        for line in rawText:
+            # use regex to take only characters in the string itself
+            # e.g. ( key:0 )"(I want this part)"( # comment)
+            match = re.match(r'(.+?)"([^"]+?)"?( *# .*)?$', line)
 
-        for key, string in innerContent.items():
-            # take only characters in the string itself
-            # e.g. string = '0 "I want this part"'
-            # string [3:-1] = 'I want this part'
-
-            string = re.sub(r' "$', r'"$', string)
-            paradoxInt = string[0]
-            innerText = string[3:-1]
+            if match is not None:
+                key, innerText = match.group(1, 2)
+            else:
+                translatedText.append(line)
+                continue
 
             # ignore empty strings
             if innerText == '':
+                translatedText.append(line)
                 continue
 
             # ignore strings that link to other strings
             if re.search(r'\$(.+?)\$', innerText) is not None:
+                translatedText.append(line)
                 continue
 
             # ignore strings that have complex formatting
@@ -137,11 +147,12 @@ def main():
             # i.e. regex match strings where:
             #      (#format is not at the beginning) OR (#! is not at the end)
 
-            # this is because if we split the string, then translate separately,
+            # this is because if we split the string and translate separately,
             # the meaning can change
             # e.g. '你是 #bold 中國 #! 人嗎?' -> ['你是', '中國', '人嗎?']
             # not translated properly -> ['you are', 'china', 'person?']
             if re.search(r'(?=.*#)(?=((?!^)(#[^!]+? )|^(.(?!.*#!$))*$))', innerText) is not None:
+                translatedText.append(line)
                 continue
 
             # if string contains formatting, obtain the tags
@@ -166,31 +177,23 @@ def main():
             if formatTag is not None:
                 newText = formatTag + ' ' + newText + '#!'
 
-            innerContent[key] = paradoxInt + ' "' + newText + '"'
-
-        content[args.language] = innerContent
-        del content[innerLanguage]
-
-        # need to do some raw string editing since CK3 yaml format is weird
-        # valid yaml is '  key: 0 "value"'
-        # CK3 uses ' key:0 "value"'
-        # width=infinite prevents yaml newline on long lines
-        rawText = yaml.dump(content, allow_unicode=True, width=float("inf")).splitlines()
-        rawText = [re.sub(r'^  (.*): ([0-9] )', r' \1:\2', line) for line in rawText]
-        rawText = '\n'.join(rawText)
+            line = key + '"' + newText + '"'
+            translatedText.append(line)
 
         newFileName = nameName + '_' + args.language + '.yml'
-        # output depends on command line switch
-        if args.output is not None:
-            outputFile = os.path.join(args.output, newFileName)
-        else:
-            outputFile = os.path.join(inputDir, newFileName)
+
+        # this can be 'None' depending on command line
+        outputPath = args.output or ''
+        verbosePrint("Saving file", os.path.join(outputPath, newFileName))
+        outputFile = os.path.join(outputPath, newFileName)
 
         # not sure if newline='\n' is necessary or Windows \r\n line endings
         # built in localization files use '\n' line endings so I assumed
         with open(outputFile, mode='w', newline='\n', encoding='utf_8_sig') as yamlFile:
-            print(rawText, file=yamlFile)
+            for line in translatedText:
+                print(line, end='\n', file=yamlFile)
     verbosePrint("Translated characters:", totalCharacterCount)
+
 
 if __name__ == '__main__':
     main()
